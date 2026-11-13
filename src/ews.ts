@@ -147,6 +147,8 @@ const attr = (xml: string, el: string, name: string) =>
 
 export const MAIL_FOLDERS = ["inbox", "sentitems", "drafts", "junkemail", "deleteditems", "archive"] as const;
 export type MailFolder = (typeof MAIL_FOLDERS)[number];
+/** Search scope: one folder, or the whole mailbox (all mail folders, searched recursively). */
+export type SearchScope = MailFolder | "all";
 
 const mailbox = (xml: string | undefined) =>
   xml === undefined
@@ -165,13 +167,52 @@ export interface MailSummary {
   preview?: string;
 }
 
-/** Overview of a folder via FindItem. Does NOT mark anything as read. */
+
+/** Like Promise.all(items.map(fn)) but with at most `limit` calls in flight (EWS throttles concurrent connections). */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i]);
+      }
+    }),
+  );
+  return out;
+}
+
+/** Ids of all mail folders (recursive), excluding Deleted Items and Junk Email. */
+async function searchableMailFolderIds(): Promise<string[]> {
+  const [all, skip] = await Promise.all([
+    ews(
+      `<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape>` +
+        `<m:Restriction><t:IsEqualTo><t:FieldURI FieldURI="folder:FolderClass"/><t:FieldURIOrConstant><t:Constant Value="IPF.Note"/></t:FieldURIOrConstant></t:IsEqualTo></m:Restriction>` +
+        `<m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>`,
+    ),
+    ews(
+      `<m:GetFolder><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape><m:FolderIds>` +
+        `<t:DistinguishedFolderId Id="deleteditems"/><t:DistinguishedFolderId Id="junkemail"/></m:FolderIds></m:GetFolder>`,
+    ),
+  ]);
+  if (/ResponseClass="Error"/.test(all)) throw new Error(`EWS error: ${unesc(tag(all, "MessageText") ?? "unknown")}`);
+  const excluded = new Set([...skip.matchAll(/<(?:\w+:)?FolderId\s[^>]*\bId="([^"]*)"/g)].map((m) => m[1]));
+  return [...all.matchAll(/<(?:\w+:)?FolderId\s[^>]*\bId="([^"]*)"/g)].map((m) => m[1]).filter((id) => !excluded.has(id));
+}
+
+/**
+ * Overview of one folder (or, with folder "all", every mail folder except Deleted/Junk) via FindItem, newest first.
+ * An optional Advanced Query Syntax `query` is evaluated server-side. Does NOT mark anything as read.
+ */
 export async function listMail(o: {
-  folder: MailFolder;
+  folder: SearchScope;
   unreadOnly: boolean;
   since?: number;
   limit: number;
   offset: number;
+  /** Advanced Query Syntax (e.g. `from:alice subject:report`). */
+  query?: string;
 }): Promise<{ totalMatching: number; returned: number; hasMore: boolean; mails: MailSummary[] }> {
   const conds: string[] = [];
   if (o.unreadOnly) {
@@ -182,32 +223,55 @@ export async function listMail(o: {
       `<t:IsGreaterThanOrEqualTo><t:FieldURI FieldURI="item:DateTimeReceived"/><t:FieldURIOrConstant><t:Constant Value="${isoNoMs(o.since)}"/></t:FieldURIOrConstant></t:IsGreaterThanOrEqualTo>`,
     );
   }
-  const restriction = conds.length
-    ? `<m:Restriction>${conds.length > 1 ? `<t:And>${conds.join("")}</t:And>` : conds[0]}</m:Restriction>`
-    : "";
-  const xml = await ews(
-    `<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>` +
-      ["item:Subject", "message:From", "item:DateTimeReceived", "message:IsRead", "item:HasAttachments", "item:Importance", "item:Preview"]
-        .map((f) => `<t:FieldURI FieldURI="${f}"/>`)
-        .join("") +
-      `</t:AdditionalProperties></m:ItemShape>` +
-      `<m:IndexedPageItemView MaxEntriesReturned="${o.limit}" Offset="${o.offset}" BasePoint="Beginning"/>` +
-      restriction +
-      `<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>` +
-      `<m:ParentFolderIds><t:DistinguishedFolderId Id="${o.folder}"/></m:ParentFolderIds></m:FindItem>`,
-  );
-  if (/ResponseClass="Error"/.test(xml)) throw new Error(`EWS error: ${unesc(tag(xml, "MessageText") ?? "unknown")}`);
-  const mails = blocks(xml, "Message").map((it) => ({
-    id: attr(it, "ItemId", "Id")!,
-    subject: unesc(tag(it, "Subject") ?? "(No subject)"),
-    from: mailbox(tag(tag(it, "From") ?? "", "Mailbox")),
-    received: new Date(utc(tag(it, "DateTimeReceived")!)).toISOString(),
-    isRead: tag(it, "IsRead") === "true",
-    hasAttachments: tag(it, "HasAttachments") === "true",
-    importance: tag(it, "Importance"),
-    preview: unesc(tag(it, "Preview") ?? "") || undefined,
-  }));
-  const total = Number(attr(xml, "RootFolder", "TotalItemsInView") ?? mails.length);
+  // EWS does not allow Restriction and QueryString together, so with a query the filters go into the query itself.
+  const aqs = o.query
+    ? [`(${o.query})`, ...(o.unreadOnly ? ["isread:false"] : []), ...(o.since !== undefined ? [`received:>=${isoNoMs(o.since).slice(0, 10)}`] : [])].join(" ")
+    : undefined;
+  const restriction = aqs || !conds.length
+    ? ""
+    : `<m:Restriction>${conds.length > 1 ? `<t:And>${conds.join("")}</t:And>` : conds[0]}</m:Restriction>`;
+
+  const findIn = async (parent: string, max: number, offset: number) => {
+    const xml = await ews(
+      `<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>` +
+        ["item:Subject", "message:From", "item:DateTimeReceived", "message:IsRead", "item:HasAttachments", "item:Importance", "item:Preview"]
+          .map((f) => `<t:FieldURI FieldURI="${f}"/>`)
+          .join("") +
+        `</t:AdditionalProperties></m:ItemShape>` +
+        `<m:IndexedPageItemView MaxEntriesReturned="${max}" Offset="${offset}" BasePoint="Beginning"/>` +
+        restriction +
+        `<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>` +
+        `<m:ParentFolderIds>${parent}</m:ParentFolderIds>` +
+        (aqs ? `<m:QueryString>${esc(aqs)}</m:QueryString>` : "") +
+        `</m:FindItem>`,
+    );
+    if (/ResponseClass="Error"/.test(xml)) throw new Error(`EWS error: ${unesc(tag(xml, "MessageText") ?? "unknown")}`);
+    const mails: MailSummary[] = blocks(xml, "Message").map((it) => ({
+      id: attr(it, "ItemId", "Id")!,
+      subject: unesc(tag(it, "Subject") ?? "(No subject)"),
+      from: mailbox(tag(tag(it, "From") ?? "", "Mailbox")),
+      received: new Date(utc(tag(it, "DateTimeReceived")!)).toISOString(),
+      isRead: tag(it, "IsRead") === "true",
+      hasAttachments: tag(it, "HasAttachments") === "true",
+      importance: tag(it, "Importance"),
+      preview: unesc(tag(it, "Preview") ?? "") || undefined,
+    }));
+    return { mails, total: Number(attr(xml, "RootFolder", "TotalItemsInView") ?? mails.length) };
+  };
+
+  if (o.folder !== "all") {
+    const r = await findIn(`<t:DistinguishedFolderId Id="${o.folder}"/>`, o.limit, o.offset);
+    return { totalMatching: r.total, returned: r.mails.length, hasMore: o.offset + r.mails.length < r.total, mails: r.mails };
+  }
+
+  // All folders: ask each for its newest (offset + limit) matches, merge by date, then page.
+  const ids = await searchableMailFolderIds();
+  const parts = await mapLimit(ids, 3, (id) => findIn(`<t:FolderId Id="${esc(id)}"/>`, o.offset + o.limit, 0));
+  const total = parts.reduce((n, p) => n + p.total, 0);
+  const mails = parts
+    .flatMap((p) => p.mails)
+    .sort((a, b) => b.received.localeCompare(a.received))
+    .slice(o.offset, o.offset + o.limit);
   return { totalMatching: total, returned: mails.length, hasMore: o.offset + mails.length < total, mails };
 }
 
