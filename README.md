@@ -31,6 +31,7 @@ Online, so check your tenant's status), and the Office client ID is borrowed, so
 | `get_events` | Events in your own calendar between two ISO datetimes (recurrences expanded). |
 | `find_free_slots` | Free meeting slots inside working hours, optionally intersected with other people's free/busy. |
 | `list_mail` | Overview of a folder, newest first: id, sender, subject, received, read state, preview. Supports `unreadOnly`, `since`, paging. |
+| `search_mail` | Server-side mail search (Exchange query syntax) across all folders or one: `from:alice subject:(budget OR forecast) hasattachments:true received:>=2026-11-01`. Same result fields as `list_mail`. |
 | `read_mail` | One message by id: headers and plain-text body. |
 | `mark_mail_read` | Mark messages read or unread (`isRead: false`). No read receipts are sent. |
 | `draft_mail` | Save a message to Drafts. Sends nothing. |
@@ -40,6 +41,10 @@ Behaviour worth knowing:
 
 - `list_mail` and `read_mail` never mark anything as read. Only `mark_mail_read` changes read state, so you can get an
   overview of unread mail without touching it.
+- `search_mail` runs Exchange's Advanced Query Syntax on the server, newest first. Searching "all" covers every mail
+  folder except Deleted Items and Junk Email; it queries folders a few at a time to stay under EWS's concurrent
+  connection limit, so very large mailboxes with many folders are slower than a single-folder search. `since` has
+  day granularity.
 - `find_free_slots` treats attendees whose free/busy can't be fetched as free and says so in `warnings`. Free/busy of
   others only works if your organisation shares it. Range is limited to 62 days.
 - `send_mail` and `draft_mail` take `to`, `cc`, `bcc`, `subject`, `body`, `isHtml`. Prefer `draft_mail` first.
