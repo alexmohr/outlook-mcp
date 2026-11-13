@@ -1,0 +1,25 @@
+{
+  "name": "outlook-mcp",
+  "version": "0.1.0",
+  "description": "Outlook (EWS) MCP server: calendar events, free meeting slots, and sending mail",
+  "type": "module",
+  "bin": {
+    "outlook-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "swiftc -O helper/main.swift -o bin/auth-helper && tsc",
+    "start": "node dist/index.js",
+    "login": "node dist/index.js login",
+    "test": "tsc && node --test dist/slots.test.js",
+    "build:ts": "tsc",
+    "init": "node dist/index.js init"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
