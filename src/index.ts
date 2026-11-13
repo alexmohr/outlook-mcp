@@ -170,6 +170,45 @@ server.registerTool(
 );
 
 server.registerTool(
+  "search_mail",
+  {
+    description:
+      "Search mail with Exchange's server-side query syntax (AQS), newest first. Bare words match anywhere; " +
+      "keywords narrow it: from:alice, to:bob, subject:report, hasattachments:true, isread:false, " +
+      "received:>=2026-11-01, and AND/OR/NOT, e.g. 'from:alice subject:(budget OR forecast) hasattachments:true'. " +
+      "Searches all mail folders except Deleted Items and Junk by default. Returns the same fields as list_mail " +
+      "(use read_mail with an id for the body). Read-only: does NOT mark anything as read.",
+    inputSchema: {
+      query: z.string().min(1).max(500).describe("AQS query"),
+      folder: z.enum([...MAIL_FOLDERS, "all"]).optional().describe("One folder, or all (default)"),
+      unreadOnly: z.boolean().optional().describe("Only unread messages (default false)"),
+      since: z.string().optional().describe("ISO 8601; only mail received on or after this date (day granularity)"),
+      limit: z.number().int().min(1).max(100).optional().describe("Default 25"),
+      offset: z.number().int().min(0).optional().describe("Skip this many (paging)"),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  async (a) => {
+    try {
+      const since = a.since === undefined ? undefined : Date.parse(a.since);
+      if (since !== undefined && Number.isNaN(since)) throw new Error("`since` is not a valid ISO 8601 datetime");
+      return text(
+        await listMail({
+          query: a.query,
+          folder: a.folder ?? "all",
+          unreadOnly: a.unreadOnly ?? false,
+          since,
+          limit: a.limit ?? 25,
+          offset: a.offset ?? 0,
+        }),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
   "read_mail",
   {
     description:
