@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { login } from "./auth.js";
 import { configPath, getConfig, writeConfig, DEFAULTS } from "./config.js";
-import { createFolder, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail } from "./ews.js";
+import { createFolder, flagMail, FLAG_STATES, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail } from "./ews.js";
 import { findFreeRanges, type WorkingHours } from "./slots.js";
 
 if (process.argv[2] === "init") {
@@ -245,6 +245,39 @@ server.registerTool(
   async ({ ids, isRead }) => {
     try {
       return text(await markMailRead(ids, isRead ?? true));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "flag_mail",
+  {
+    description:
+      "Set the follow-up flag on messages: 'flagged' (optionally with dueDate, and startDate which defaults to now), " +
+      "'complete' (marks the follow-up done) or 'cleared' (removes the flag). list_mail and read_mail show the flag.",
+    inputSchema: {
+      ids: z.array(z.string().min(1)).min(1).max(50).describe("Message ids from list_mail or search_mail"),
+      state: z.enum(FLAG_STATES).optional().describe("Default flagged"),
+      dueDate: z.string().optional().describe("ISO 8601; only with state flagged"),
+      startDate: z.string().optional().describe("ISO 8601; only with dueDate, default now"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  async ({ ids, state, dueDate, startDate }) => {
+    try {
+      const s = state ?? "flagged";
+      if (startDate !== undefined && dueDate === undefined) throw new Error("`startDate` needs `dueDate`");
+      if (dueDate !== undefined && s !== "flagged") throw new Error("`dueDate` only applies to state flagged");
+      let dates: { start: number; due: number } | undefined;
+      if (dueDate !== undefined) {
+        const due = Date.parse(dueDate), start = startDate === undefined ? Math.min(Date.now(), due) : Date.parse(startDate);
+        if (Number.isNaN(due) || Number.isNaN(start)) throw new Error("`dueDate`/`startDate` must be ISO 8601 datetimes");
+        if (start > due) throw new Error("`startDate` must not be after `dueDate`");
+        dates = { start, due };
+      }
+      return text(await flagMail(ids, s, dates));
     } catch (e) {
       return fail(e);
     }
