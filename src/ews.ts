@@ -156,6 +156,9 @@ const mailbox = (xml: string | undefined) =>
     : { name: unesc(tag(xml, "Name") ?? "") || undefined, email: unesc(tag(xml, "EmailAddress") ?? "") || undefined };
 const mailboxes = (xml: string | undefined) => blocks(xml ?? "", "Mailbox").map((m) => mailbox(m)!);
 
+/** Element names of mail items: meeting requests/responses/cancellations are mail too but have their own types. */
+const MAIL_ITEM = "(?:Message|MeetingRequest|MeetingResponse|MeetingCancellation)";
+
 export interface MailSummary {
   id: string;
   subject: string;
@@ -246,7 +249,7 @@ export async function listMail(o: {
         `</m:FindItem>`,
     );
     if (/ResponseClass="Error"/.test(xml)) throw new Error(`EWS error: ${unesc(tag(xml, "MessageText") ?? "unknown")}`);
-    const mails: MailSummary[] = blocks(xml, "Message").map((it) => ({
+    const mails: MailSummary[] = blocks(xml, MAIL_ITEM).map((it) => ({
       id: attr(it, "ItemId", "Id")!,
       subject: unesc(tag(it, "Subject") ?? "(No subject)"),
       from: mailbox(tag(tag(it, "From") ?? "", "Mailbox")),
@@ -293,7 +296,7 @@ export async function readMail(id: string, maxChars: number): Promise<MailFull> 
       `</t:AdditionalProperties></m:ItemShape><m:ItemIds><t:ItemId Id="${esc(id)}"/></m:ItemIds></m:GetItem>`,
   );
   if (/ResponseClass="Error"/.test(xml)) throw new Error(`EWS error: ${unesc(tag(xml, "MessageText") ?? "unknown")}`);
-  const it = blocks(xml, "Message")[0];
+  const it = blocks(xml, MAIL_ITEM)[0];
   if (!it) throw new Error("Message not found");
   const body = unesc(tag(it, "Body") ?? "").replace(/\r\n?/g, "\n");
   return {
