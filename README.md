@@ -37,6 +37,7 @@ Online, so check your tenant's status), and the Office client ID is borrowed, so
 | `create_folder` | Create a folder at the top level or under a parent folder. |
 | `move_mail` | Move messages into a folder (sorting / filing). Returns each message's new id. |
 | `mark_mail_read` | Mark messages read or unread (`isRead: false`). No read receipts are sent. |
+| `flag_mail` | Set the follow-up flag: `flagged` (optional due date), `complete`, or `cleared`. |
 | `draft_mail` | Save a message to Drafts. Sends nothing. |
 | `send_mail` | Send a message from your mailbox. Irreversible. |
 
@@ -53,12 +54,13 @@ Behaviour worth knowing:
   find it with `search_mail` or `list_mail`, then `move_mail` it.
 - `move_mail` gives moved messages new ids; the old ids stop working. `create_folder` fails if the name already exists
   under that parent.
+- `list_mail`, `search_mail` and `read_mail` include `flag` (`Flagged` or `Complete`) when a message is flagged.
 - Meeting requests, responses and cancellations are listed, read and moved like ordinary mail.
 - `find_free_slots` treats attendees whose free/busy can't be fetched as free and says so in `warnings`. Free/busy of
   others only works if your organisation shares it. Range is limited to 62 days.
 - `send_mail` and `draft_mail` take `to`, `cc`, `bcc`, `subject`, `body`, `isHtml`. Prefer `draft_mail` first.
 - Read-only tools are annotated `readOnlyHint`, so you can allowlist them separately from `mark_mail_read`,
-  `create_folder`, `move_mail`, `draft_mail` and `send_mail`.
+  `flag_mail`, `create_folder`, `move_mail`, `draft_mail` and `send_mail`.
 
 ## Setup
 
