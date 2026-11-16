@@ -320,25 +320,30 @@ export async function readMail(id: string, maxChars: number): Promise<MailFull> 
   };
 }
 
-/** Set the read flag on one or more messages via UpdateItem (no read receipts are sent). */
-export async function markMailRead(ids: string[], isRead: boolean): Promise<{ id: string; ok: boolean; error?: string }[]> {
+type ItemResult = { id: string; ok: boolean; error?: string };
+
+/** Apply the same field update to several items via UpdateItem, reporting success per item. */
+async function updateItems(ids: string[], update: string): Promise<ItemResult[]> {
   const xml = await ews(
     `<m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="AlwaysOverwrite"><m:ItemChanges>` +
-      ids
-        .map(
-          (id) =>
-            `<t:ItemChange><t:ItemId Id="${esc(id)}"/><t:Updates><t:SetItemField><t:FieldURI FieldURI="message:IsRead"/>` +
-            `<t:Message><t:IsRead>${isRead}</t:IsRead></t:Message></t:SetItemField></t:Updates></t:ItemChange>`,
-        )
-        .join("") +
+      ids.map((id) => `<t:ItemChange><t:ItemId Id="${esc(id)}"/><t:Updates>${update}</t:Updates></t:ItemChange>`).join("") +
       `</m:ItemChanges></m:UpdateItem>`,
   );
   const rs = [...xml.matchAll(/<(?:\w+:)?UpdateItemResponseMessage\s+ResponseClass="(\w+)"[^>]*>([\s\S]*?)<\/(?:\w+:)?UpdateItemResponseMessage>/g)];
+  if (!rs.length && /ResponseClass="Error"/.test(xml)) throw ewsError(xml);
   return ids.map((id, i) => {
     const r = rs[i];
     if (r?.[1] === "Success") return { id, ok: true };
     return { id, ok: false, error: unesc(tag(r?.[2] ?? "", "MessageText") ?? "no response") };
   });
+}
+
+/** Set the read flag on one or more messages via UpdateItem (no read receipts are sent). */
+export async function markMailRead(ids: string[], isRead: boolean): Promise<ItemResult[]> {
+  return updateItems(
+    ids,
+    `<t:SetItemField><t:FieldURI FieldURI="message:IsRead"/><t:Message><t:IsRead>${isRead}</t:IsRead></t:Message></t:SetItemField>`,
+  );
 }
 
 export interface FolderInfo {
