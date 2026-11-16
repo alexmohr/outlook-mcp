@@ -146,9 +146,14 @@ const attr = (xml: string, el: string, name: string) =>
   new RegExp(`<(?:\\w+:)?${el}\\s[^>]*\\b${name}="([^"]*)"`).exec(xml)?.[1];
 
 export const MAIL_FOLDERS = ["inbox", "sentitems", "drafts", "junkemail", "deleteditems", "archive"] as const;
-export type MailFolder = (typeof MAIL_FOLDERS)[number];
-/** Search scope: one folder, or the whole mailbox (all mail folders, searched recursively). */
-export type SearchScope = MailFolder | "all";
+/** Well-known folders addressable by name; "msgfolderroot" is the top of the mail folder tree. */
+const WELL_KNOWN = new Set<string>([...MAIL_FOLDERS, "msgfolderroot"]);
+
+/** A well-known folder name (case-insensitive) or a folder id from listFolders, as an EWS folder id element. */
+const folderRef = (f: string) =>
+  WELL_KNOWN.has(f.toLowerCase()) ? `<t:DistinguishedFolderId Id="${f.toLowerCase()}"/>` : `<t:FolderId Id="${esc(f)}"/>`;
+
+const ewsError = (xml: string) => new Error(`EWS error: ${unesc(tag(xml, "MessageText") ?? "unknown")}`);
 
 const mailbox = (xml: string | undefined) =>
   xml === undefined
@@ -209,7 +214,8 @@ async function searchableMailFolderIds(): Promise<string[]> {
  * An optional Advanced Query Syntax `query` is evaluated server-side. Does NOT mark anything as read.
  */
 export async function listMail(o: {
-  folder: SearchScope;
+  /** Well-known folder name, folder id, or "all" (every mail folder except Deleted/Junk). */
+  folder: string;
   unreadOnly: boolean;
   since?: number;
   limit: number;
@@ -263,7 +269,7 @@ export async function listMail(o: {
   };
 
   if (o.folder !== "all") {
-    const r = await findIn(`<t:DistinguishedFolderId Id="${o.folder}"/>`, o.limit, o.offset);
+    const r = await findIn(folderRef(o.folder), o.limit, o.offset);
     return { totalMatching: r.total, returned: r.mails.length, hasMore: o.offset + r.mails.length < r.total, mails: r.mails };
   }
 
@@ -331,6 +337,73 @@ export async function markMailRead(ids: string[], isRead: boolean): Promise<{ id
   return ids.map((id, i) => {
     const r = rs[i];
     if (r?.[1] === "Success") return { id, ok: true };
+    return { id, ok: false, error: unesc(tag(r?.[2] ?? "", "MessageText") ?? "no response") };
+  });
+}
+
+export interface FolderInfo {
+  id: string;
+  name: string;
+  /** Slash-separated display path from the top of the mailbox, e.g. "Inbox/Projects". */
+  path: string;
+  parentId?: string;
+  totalCount: number;
+  unreadCount: number;
+}
+
+/** All mail folders (recursive) with their paths and counts, via FindFolder. */
+export async function listFolders(): Promise<FolderInfo[]> {
+  const xml = await ews(
+    `<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>` +
+      ["folder:DisplayName", "folder:ParentFolderId", "folder:TotalCount", "folder:UnreadCount"]
+        .map((f) => `<t:FieldURI FieldURI="${f}"/>`)
+        .join("") +
+      `</t:AdditionalProperties></m:FolderShape>` +
+      `<m:Restriction><t:IsEqualTo><t:FieldURI FieldURI="folder:FolderClass"/><t:FieldURIOrConstant><t:Constant Value="IPF.Note"/></t:FieldURIOrConstant></t:IsEqualTo></m:Restriction>` +
+      `<m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>`,
+  );
+  if (/ResponseClass="Error"/.test(xml)) throw ewsError(xml);
+  const raw = blocks(xml, "Folder").map((f) => ({
+    id: attr(f, "FolderId", "Id")!,
+    name: unesc(tag(f, "DisplayName") ?? ""),
+    parentId: attr(f, "ParentFolderId", "Id"),
+    totalCount: Number(tag(f, "TotalCount") ?? 0),
+    unreadCount: Number(tag(f, "UnreadCount") ?? 0),
+  }));
+  const byId = new Map(raw.map((f) => [f.id, f]));
+  const path = (f: (typeof raw)[number], depth = 0): string => {
+    const parent = f.parentId ? byId.get(f.parentId) : undefined;
+    return parent && depth < 50 ? `${path(parent, depth + 1)}/${f.name}` : f.name;
+  };
+  return raw
+    .map((f) => ({ ...f, path: path(f), parentId: f.parentId && byId.has(f.parentId) ? f.parentId : undefined }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/** Create a mail folder under `parent` (well-known name or folder id; "msgfolderroot" = top level) via CreateFolder. */
+export async function createFolder(name: string, parent: string): Promise<{ id: string; name: string }> {
+  const xml = await ews(
+    `<m:CreateFolder><m:ParentFolderId>${folderRef(parent)}</m:ParentFolderId><m:Folders><t:Folder>` +
+      `<t:FolderClass>IPF.Note</t:FolderClass><t:DisplayName>${esc(name)}</t:DisplayName>` +
+      `</t:Folder></m:Folders></m:CreateFolder>`,
+  );
+  const id = attr(xml, "FolderId", "Id");
+  if (/ResponseClass="Error"/.test(xml) || !id) throw ewsError(xml);
+  return { id, name };
+}
+
+/** Move messages to a folder (well-known name or folder id) via MoveItem. Moved messages get new ids. */
+export async function moveMail(ids: string[], destination: string): Promise<{ id: string; ok: boolean; newId?: string; error?: string }[]> {
+  const xml = await ews(
+    `<m:MoveItem><m:ToFolderId>${folderRef(destination)}</m:ToFolderId><m:ItemIds>` +
+      ids.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join("") +
+      `</m:ItemIds></m:MoveItem>`,
+  );
+  const rs = [...xml.matchAll(/<(?:\w+:)?MoveItemResponseMessage\s+ResponseClass="(\w+)"[^>]*>([\s\S]*?)<\/(?:\w+:)?MoveItemResponseMessage>/g)];
+  if (!rs.length && /ResponseClass="Error"/.test(xml)) throw ewsError(xml);
+  return ids.map((id, i) => {
+    const r = rs[i];
+    if (r?.[1] === "Success") return { id, ok: true, newId: attr(r[2], "ItemId", "Id") };
     return { id, ok: false, error: unesc(tag(r?.[2] ?? "", "MessageText") ?? "no response") };
   });
 }
