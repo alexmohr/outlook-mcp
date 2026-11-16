@@ -164,6 +164,11 @@ const mailboxes = (xml: string | undefined) => blocks(xml ?? "", "Mailbox").map(
 /** Element names of mail items: meeting requests/responses/cancellations are mail too but have their own types. */
 const MAIL_ITEM = "(?:Message|MeetingRequest|MeetingResponse|MeetingCancellation)";
 
+const flagStatus = (it: string) => {
+  const f = tag(tag(it, "Flag") ?? "", "FlagStatus");
+  return f && f !== "NotFlagged" ? f : undefined;
+};
+
 export interface MailSummary {
   id: string;
   subject: string;
@@ -173,6 +178,8 @@ export interface MailSummary {
   hasAttachments: boolean;
   importance?: string;
   preview?: string;
+  /** Follow-up flag: "Flagged" or "Complete"; omitted when not flagged. */
+  flag?: string;
 }
 
 
@@ -243,7 +250,7 @@ export async function listMail(o: {
   const findIn = async (parent: string, max: number, offset: number) => {
     const xml = await ews(
       `<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>` +
-        ["item:Subject", "message:From", "item:DateTimeReceived", "message:IsRead", "item:HasAttachments", "item:Importance", "item:Preview"]
+        ["item:Subject", "message:From", "item:DateTimeReceived", "message:IsRead", "item:HasAttachments", "item:Importance", "item:Preview", "item:Flag"]
           .map((f) => `<t:FieldURI FieldURI="${f}"/>`)
           .join("") +
         `</t:AdditionalProperties></m:ItemShape>` +
@@ -264,6 +271,7 @@ export async function listMail(o: {
       hasAttachments: tag(it, "HasAttachments") === "true",
       importance: tag(it, "Importance"),
       preview: unesc(tag(it, "Preview") ?? "") || undefined,
+      flag: flagStatus(it),
     }));
     return { mails, total: Number(attr(xml, "RootFolder", "TotalItemsInView") ?? mails.length) };
   };
@@ -296,7 +304,7 @@ export async function readMail(id: string, maxChars: number): Promise<MailFull> 
   const xml = await ews(
     `<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:BodyType>Text</t:BodyType><t:AdditionalProperties>` +
       ["item:Subject", "message:From", "message:ToRecipients", "message:CcRecipients", "item:DateTimeReceived", "message:IsRead",
-       "item:HasAttachments", "item:Importance", "item:Body"]
+       "item:HasAttachments", "item:Importance", "item:Flag", "item:Body"]
         .map((f) => `<t:FieldURI FieldURI="${f}"/>`)
         .join("") +
       `</t:AdditionalProperties></m:ItemShape><m:ItemIds><t:ItemId Id="${esc(id)}"/></m:ItemIds></m:GetItem>`,
@@ -315,6 +323,7 @@ export async function readMail(id: string, maxChars: number): Promise<MailFull> 
     isRead: tag(it, "IsRead") === "true",
     hasAttachments: tag(it, "HasAttachments") === "true",
     importance: tag(it, "Importance"),
+    flag: flagStatus(it),
     body: body.slice(0, maxChars),
     bodyTruncated: body.length > maxChars,
   };
@@ -344,6 +353,24 @@ export async function markMailRead(ids: string[], isRead: boolean): Promise<Item
     ids,
     `<t:SetItemField><t:FieldURI FieldURI="message:IsRead"/><t:Message><t:IsRead>${isRead}</t:IsRead></t:Message></t:SetItemField>`,
   );
+}
+
+export const FLAG_STATES = ["flagged", "complete", "cleared"] as const;
+export type FlagState = (typeof FLAG_STATES)[number];
+
+/**
+ * Set the follow-up flag on messages: flagged (optionally with start and due date), complete (marked done now),
+ * or cleared.
+ */
+export async function flagMail(ids: string[], state: FlagState, dates?: { start: number; due: number }): Promise<ItemResult[]> {
+  const inner =
+    state === "cleared"
+      ? `<t:FlagStatus>NotFlagged</t:FlagStatus>`
+      : state === "complete"
+        ? `<t:FlagStatus>Complete</t:FlagStatus><t:CompleteDate>${isoNoMs(Date.now())}</t:CompleteDate>`
+        : `<t:FlagStatus>Flagged</t:FlagStatus>` +
+          (dates ? `<t:StartDate>${isoNoMs(dates.start)}</t:StartDate><t:DueDate>${isoNoMs(dates.due)}</t:DueDate>` : "");
+  return updateItems(ids, `<t:SetItemField><t:FieldURI FieldURI="item:Flag"/><t:Message><t:Flag>${inner}</t:Flag></t:Message></t:SetItemField>`);
 }
 
 export interface FolderInfo {
