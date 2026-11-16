@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { login } from "./auth.js";
 import { configPath, getConfig, writeConfig, DEFAULTS } from "./config.js";
-import { getBusy, getEvents, getMyEmail, listMail, MAIL_FOLDERS, markMailRead, readMail, sendMail } from "./ews.js";
+import { createFolder, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail } from "./ews.js";
 import { findFreeRanges, type WorkingHours } from "./slots.js";
 
 if (process.argv[2] === "init") {
@@ -40,6 +40,9 @@ if (process.argv[2] === "login") {
 }
 
 const server = new McpServer({ name: "outlook-mcp", version: "0.1.0" });
+
+const WELL_KNOWN_HELP = MAIL_FOLDERS.join(", ");
+const folderArg = z.string().min(1).max(1024);
 
 const text = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] });
 const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const, text: (e as Error).message }] });
@@ -142,7 +145,7 @@ server.registerTool(
       "Overview of mail in a folder, newest first: id, sender, subject, received time, read state and a short preview. " +
       "Use unreadOnly for an unread overview. Read-only: does NOT mark anything as read. Use read_mail with an id for the full body.",
     inputSchema: {
-      folder: z.enum(MAIL_FOLDERS).optional().describe("Default inbox"),
+      folder: folderArg.optional().describe(`${WELL_KNOWN_HELP}, or a folder id from list_folders. Default inbox`),
       unreadOnly: z.boolean().optional().describe("Only unread messages (default false)"),
       since: z.string().optional().describe("ISO 8601; only mail received at or after this instant"),
       limit: z.number().int().min(1).max(100).optional().describe("Default 25"),
@@ -180,7 +183,7 @@ server.registerTool(
       "(use read_mail with an id for the body). Read-only: does NOT mark anything as read.",
     inputSchema: {
       query: z.string().min(1).max(500).describe("AQS query"),
-      folder: z.enum([...MAIL_FOLDERS, "all"]).optional().describe("One folder, or all (default)"),
+      folder: folderArg.optional().describe(`all (default), ${WELL_KNOWN_HELP}, or a folder id from list_folders`),
       unreadOnly: z.boolean().optional().describe("Only unread messages (default false)"),
       since: z.string().optional().describe("ISO 8601; only mail received on or after this date (day granularity)"),
       limit: z.number().int().min(1).max(100).optional().describe("Default 25"),
@@ -242,6 +245,66 @@ server.registerTool(
   async ({ ids, isRead }) => {
     try {
       return text(await markMailRead(ids, isRead ?? true));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "list_folders",
+  {
+    description:
+      "List all mail folders (including subfolders) with id, path (e.g. 'Inbox/Projects'), parent id, total and " +
+      "unread counts. Use the ids with list_mail, search_mail, move_mail and create_folder.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  async () => {
+    try {
+      return text(await listFolders());
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "create_folder",
+  {
+    description:
+      "Create a mail folder. Without parent it is created at the top level (next to Inbox); with parent it becomes a " +
+      "subfolder. Fails if a folder with that name already exists there. Returns the new folder's id.",
+    inputSchema: {
+      name: z.string().trim().min(1).max(255).describe("Folder display name"),
+      parent: folderArg.optional().describe(`${WELL_KNOWN_HELP}, or a folder id from list_folders. Default: top level`),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async ({ name, parent }) => {
+    try {
+      return text(await createFolder(name, parent ?? "msgfolderroot"));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "move_mail",
+  {
+    description:
+      "Move messages into a folder, e.g. to sort mail found with list_mail or search_mail. Moved messages get new ids " +
+      "(returned as newId); the old ids stop working. Does not change read state.",
+    inputSchema: {
+      ids: z.array(z.string().min(1)).min(1).max(50).describe("Message ids from list_mail or search_mail"),
+      destination: folderArg.describe(`${WELL_KNOWN_HELP}, or a folder id from list_folders`),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async ({ ids, destination }) => {
+    try {
+      return text(await moveMail(ids, destination));
     } catch (e) {
       return fail(e);
     }
