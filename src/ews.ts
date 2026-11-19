@@ -595,3 +595,121 @@ export async function moveMail(ids: string[], destination: string): Promise<{ id
     return { id, ok: false, error: unesc(tag(r?.[2] ?? "", "MessageText") ?? "no response") };
   });
 }
+
+export const RULE_IMPORTANCE = ["Low", "Normal", "High"] as const;
+
+export interface RuleInput {
+  name: string;
+  priority?: number;
+  enabled?: boolean;
+  /** Conditions (all must match). */
+  fromAddresses?: string[];
+  senderContains?: string[];
+  subjectContains?: string[];
+  bodyContains?: string[];
+  sentToAddresses?: string[];
+  hasAttachments?: boolean;
+  importance?: (typeof RULE_IMPORTANCE)[number];
+  /** Actions. */
+  moveToFolder?: string;
+  markAsRead?: boolean;
+  markImportance?: (typeof RULE_IMPORTANCE)[number];
+  assignCategories?: string[];
+  deleteMessage?: boolean;
+  stopProcessingRules?: boolean;
+}
+
+export interface InboxRule {
+  id: string;
+  name: string;
+  priority: number;
+  enabled: boolean;
+  notSupported: boolean;
+  inError: boolean;
+  conditions: Record<string, unknown>;
+  exceptions: Record<string, unknown>;
+  actions: Record<string, unknown>;
+}
+
+/** Top-level elements of a rule predicate/action block as name -> strings, addresses, folder id or scalar. */
+function ruleParts(xml: string | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const m of (xml ?? "").matchAll(/<(?:\w+:)?(\w+)(?:\s[^>]*)?(?:\/>|>([\s\S]*?)<\/(?:\w+:)?\1>)/g)) {
+    const [whole, name, inner = ""] = m;
+    if (/^(String|Address|EmailAddress|Name|RoutingType|Mailbox|FolderId|DistinguishedFolderId)$/.test(name)) continue;
+    const strings = blocks(inner, "String").map(unesc);
+    const emails = blocks(inner, "EmailAddress").map(unesc);
+    const folder = attr(whole, "FolderId", "Id") ?? attr(whole, "DistinguishedFolderId", "Id");
+    out[name] = strings.length ? strings : emails.length ? emails : folder ? { folderId: folder } : inner === "true" ? true : inner === "false" ? false : unesc(inner);
+  }
+  return out;
+}
+
+/** All inbox rules of the mailbox, via GetInboxRules. */
+export async function listRules(): Promise<InboxRule[]> {
+  const xml = await ews(`<m:GetInboxRules><m:MailboxSmtpAddress>${esc(await getMyEmail())}</m:MailboxSmtpAddress></m:GetInboxRules>`);
+  if (/ResponseClass="Error"/.test(xml)) throw ewsError(xml);
+  return blocks(blocks(xml, "InboxRules")[0] ?? "", "Rule").map((r) => ({
+    id: tag(r, "RuleId") ?? "",
+    name: unesc(tag(r, "DisplayName") ?? ""),
+    priority: Number(tag(r, "Priority") ?? 0),
+    enabled: tag(r, "IsEnabled") === "true",
+    notSupported: tag(r, "IsNotSupported") === "true",
+    inError: tag(r, "IsInError") === "true",
+    conditions: ruleParts(tag(r, "Conditions")),
+    exceptions: ruleParts(tag(r, "Exceptions")),
+    actions: ruleParts(tag(r, "Actions")),
+  })).sort((a, b) => a.priority - b.priority);
+}
+
+const strings = (el: string, vs: string[] | undefined) =>
+  vs?.length ? `<t:${el}>${vs.map((v) => `<t:String>${esc(v)}</t:String>`).join("")}</t:${el}>` : "";
+const addresses = (el: string, vs: string[] | undefined) =>
+  vs?.length ? `<t:${el}>${vs.map((v) => `<t:Address><t:EmailAddress>${esc(v)}</t:EmailAddress></t:Address>`).join("")}</t:${el}>` : "";
+
+/** Run UpdateInboxRules with one operation, surfacing per-operation validation errors. */
+async function updateRules(operation: string): Promise<void> {
+  const xml = await ews(`<m:UpdateInboxRules><m:Operations>${operation}</m:Operations></m:UpdateInboxRules>`);
+  const errs = blocks(xml, "RuleOperationError").flatMap((e) => blocks(e, "ValidationErrors")).flatMap((v) => blocks(v, "Error")).map((e) => unesc(tag(e, "ErrorMessage") ?? tag(e, "FieldValue") ?? "invalid"));
+  if (errs.length) throw new Error(`Rule rejected: ${errs.join("; ")}`);
+  if (/ResponseClass="Error"/.test(xml)) throw ewsError(xml);
+}
+
+/** Create an inbox rule (appended after existing rules unless priority is given) and return it as stored. */
+export async function createRule(r: RuleInput): Promise<InboxRule> {
+  const existing = await listRules();
+  if (existing.some((e) => e.name === r.name)) throw new Error(`A rule named "${r.name}" already exists`);
+  // Element order follows the EWS schema (RulePredicatesType / RuleActionsType).
+  const conditions =
+    strings("ContainsBodyStrings", r.bodyContains) +
+    strings("ContainsSenderStrings", r.senderContains) +
+    strings("ContainsSubjectStrings", r.subjectContains) +
+    addresses("FromAddresses", r.fromAddresses) +
+    (r.hasAttachments === undefined ? "" : `<t:HasAttachments>${r.hasAttachments}</t:HasAttachments>`) +
+    (r.importance ? `<t:Importance>${r.importance}</t:Importance>` : "") +
+    addresses("SentToAddresses", r.sentToAddresses);
+  const actions =
+    (r.assignCategories?.length ? `<t:AssignCategories>${r.assignCategories.map((c) => `<t:String>${esc(c)}</t:String>`).join("")}</t:AssignCategories>` : "") +
+    (r.deleteMessage ? `<t:Delete>true</t:Delete>` : "") +
+    (r.markImportance ? `<t:MarkImportance>${r.markImportance}</t:MarkImportance>` : "") +
+    (r.markAsRead ? `<t:MarkAsRead>true</t:MarkAsRead>` : "") +
+    (r.moveToFolder ? `<t:MoveToFolder>${folderRef(r.moveToFolder)}</t:MoveToFolder>` : "") +
+    (r.stopProcessingRules ? `<t:StopProcessingRules>true</t:StopProcessingRules>` : "");
+  if (!conditions) throw new Error("A rule needs at least one condition (otherwise it would match every message)");
+  if (!actions) throw new Error("A rule needs at least one action");
+  const priority = r.priority ?? Math.max(0, ...existing.map((e) => e.priority)) + 1;
+  await updateRules(
+    `<t:CreateRuleOperation><t:Rule><t:DisplayName>${esc(r.name)}</t:DisplayName><t:Priority>${priority}</t:Priority>` +
+      `<t:IsEnabled>${r.enabled ?? true}</t:IsEnabled><t:Conditions>${conditions}</t:Conditions>` +
+      `<t:Actions>${actions}</t:Actions></t:Rule></t:CreateRuleOperation>`,
+  );
+  const created = (await listRules()).find((e) => e.name === r.name);
+  if (!created) throw new Error("Rule was accepted but not found afterwards");
+  return created;
+}
+
+/** Delete an inbox rule by id (from listRules). */
+export async function deleteRule(id: string): Promise<{ id: string; deleted: true }> {
+  await updateRules(`<t:DeleteRuleOperation><t:RuleId>${esc(id)}</t:RuleId></t:DeleteRuleOperation>`);
+  return { id, deleted: true };
+}
