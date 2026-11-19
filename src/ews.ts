@@ -87,7 +87,7 @@ export interface EventSummary {
 }
 
 /** Own calendar events (read-only) via FindItem + CalendarView (expands recurrences). */
-export async function getEvents(from: number, to: number): Promise<EventSummary[]> {
+export async function getEvents(from: number, to: number): Promise<{ events: EventSummary[]; truncated: boolean }> {
   const xml = await ews(
     `<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>Default</t:BaseShape><t:AdditionalProperties>` +
       ["item:Subject", "calendar:Start", "calendar:End", "calendar:IsAllDayEvent", "calendar:Location", "calendar:Organizer"]
@@ -98,7 +98,7 @@ export async function getEvents(from: number, to: number): Promise<EventSummary[
       `<m:ParentFolderIds><t:DistinguishedFolderId Id="calendar"/></m:ParentFolderIds></m:FindItem>`,
   );
   if (/ResponseClass="Error"/.test(xml)) throw new Error(`EWS error: ${unesc(tag(xml, "MessageText") ?? "unknown")}`);
-  return blocks(xml, "CalendarItem")
+  const events = blocks(xml, "CalendarItem")
     .map((it) => ({
       subject: unesc(tag(it, "Subject") ?? "(No subject)"),
       start: new Date(utc(tag(it, "Start")!)).toISOString(),
@@ -108,6 +108,162 @@ export async function getEvents(from: number, to: number): Promise<EventSummary[
       organizer: unesc(tag(tag(it, "Organizer") ?? "", "Name") ?? "") || undefined,
     }))
     .sort((a, b) => a.start.localeCompare(b.start));
+  const total = Number(attr(xml, "RootFolder", "TotalItemsInView") ?? events.length);
+  return { events, truncated: events.length < total };
+}
+
+export const SHOW_AS = ["Busy", "Tentative", "Free", "OOF"] as const;
+export type ShowAs = (typeof SHOW_AS)[number];
+
+export const RECURRENCE_PATTERNS = ["daily", "weekly", "monthly", "yearly"] as const;
+export const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
+
+export interface EventRecurrence {
+  pattern: (typeof RECURRENCE_PATTERNS)[number];
+  /** Repeat every `interval` days/weeks/months/years. */
+  interval?: number;
+  /** Weekly only; defaults to the weekday of `start`. */
+  daysOfWeek?: string[];
+  /** Monthly/yearly only; defaults to the day of month of `start` (yearly then keeps the start month). */
+  dayOfMonth?: number;
+  /** Stop after this many occurrences (alternative to `ends`). */
+  occurrences?: number;
+  /** Stop repeating after this instant (alternative to `occurrences`). */
+  ends?: number;
+}
+
+export interface MeetingInput {
+  subject: string;
+  start: number;
+  end: number;
+  location?: string;
+  body?: string;
+  isHtml?: boolean;
+  attendees?: string[];
+  optionalAttendees?: string[];
+  reminderMinutes?: number;
+  showAs?: ShowAs;
+  recurrence?: EventRecurrence;
+  /** Save to the calendar (appointment, or draft request with attendees) instead of sending invitations. */
+  saveAsDraft: boolean;
+}
+
+/** Calendar timezone used to derive recurrence day-of-week/day-of-month/month from the start time. */
+const eventTimeZone = () => getConfig().timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/** Date (and parts) of an instant in the calendar's display time zone. */
+function eventDateParts(t: number) {
+  const opts: Intl.DateTimeFormatOptions = { timeZone: eventTimeZone(), weekday: "long", day: "numeric", year: "numeric" };
+  const name = new Intl.DateTimeFormat("en-US", { ...opts, month: "long" }).formatToParts(new Date(t));
+  const num = new Intl.DateTimeFormat("en-US", { ...opts, month: "numeric" }).formatToParts(new Date(t));
+  const g = (parts: Intl.DateTimeFormatPart[], type: string) => parts.find((x) => x.type === type)!.value;
+  const pad = (s: string) => s.padStart(2, "0");
+  return {
+    weekday: g(name, "weekday"),
+    monthName: g(name, "month"),
+    dayOfMonth: Number(g(num, "day")),
+    isoDate: `${g(num, "year")}-${pad(g(num, "month"))}-${pad(g(num, "day"))}`,
+  };
+}
+
+/**
+ * Exchange Online ignores `RecurrenceEnd`, so a date-bounded series is converted to an occurrence count by
+ * simulating the pattern day by day (absolute monthly/yearly patterns skip months that lack the day, like Exchange).
+ */
+function countOccurrences(parts: ReturnType<typeof eventDateParts>, endIsoDate: string, r: EventRecurrence): number {
+  const start = Date.parse(`${parts.isoDate}T00:00:00Z`);
+  const end = Date.parse(`${endIsoDate}T00:00:00Z`);
+  if (end - start > 20 * 365 * 86_400_000) throw new Error("Recurrence `ends` must be within 20 years of `start`");
+  const interval = r.interval ?? 1;
+  const dayOfMonth = r.dayOfMonth ?? parts.dayOfMonth;
+  const days = new Set(r.pattern === "weekly" ? (r.daysOfWeek ?? [parts.weekday]) : []);
+  const sd = new Date(start);
+  let n = 0;
+  for (let t = start; t <= end; t += 86_400_000) {
+    const d = new Date(t);
+    const dayDiff = Math.round((t - start) / 86_400_000);
+    const monthDiff = (d.getUTCFullYear() - sd.getUTCFullYear()) * 12 + (d.getUTCMonth() - sd.getUTCMonth());
+    if (r.pattern === "daily" && dayDiff % interval === 0) n++;
+    else if (r.pattern === "weekly" && days.has(WEEKDAYS[d.getUTCDay()]) && Math.floor(dayDiff / 7) % interval === 0) n++;
+    else if (r.pattern === "monthly" && d.getUTCDate() === dayOfMonth && monthDiff % interval === 0) n++;
+    else if (r.pattern === "yearly" && d.getUTCDate() === dayOfMonth && monthDiff % (interval * 12) === 0) n++;
+  }
+  if (n < 1) throw new Error("Recurrence `ends` before the first occurrence");
+  return n;
+}
+
+function recurrenceXml(start: number, r: EventRecurrence): string {
+  if (r.daysOfWeek && r.pattern !== "weekly") throw new Error("`daysOfWeek` only applies to weekly recurrence");
+  if (r.dayOfMonth && r.pattern !== "monthly" && r.pattern !== "yearly") throw new Error("`dayOfMonth` only applies to monthly/yearly recurrence");
+  if (r.occurrences !== undefined && r.ends !== undefined) throw new Error("recurrence: use either `occurrences` or `ends`, not both");
+  const interval = r.interval ?? 1;
+  const parts = eventDateParts(start);
+  const occurrences = r.occurrences ?? (r.ends !== undefined ? countOccurrences(parts, eventDateParts(r.ends).isoDate, r) : undefined);
+  const end = occurrences !== undefined
+    ? `<t:NumberedRecurrence><t:StartDate>${parts.isoDate}</t:StartDate><t:NumberOfOccurrences>${occurrences}</t:NumberOfOccurrences></t:NumberedRecurrence>`
+    : "";
+  switch (r.pattern) {
+    case "daily":
+      return `<t:Recurrence><t:DailyRecurrence><t:Interval>${interval}</t:Interval></t:DailyRecurrence>${end}</t:Recurrence>`;
+    case "weekly": {
+      const days = (r.daysOfWeek ?? [parts.weekday]).filter((d) => (WEEKDAYS as readonly string[]).includes(d)).join(" ");
+      if (!days) throw new Error("`daysOfWeek` must use the English weekday names");
+      return `<t:Recurrence><t:WeeklyRecurrence><t:Interval>${interval}</t:Interval><t:DaysOfWeek>${days}</t:DaysOfWeek></t:WeeklyRecurrence>${end}</t:Recurrence>`;
+    }
+    case "monthly":
+      return `<t:Recurrence><t:AbsoluteMonthlyRecurrence><t:Interval>${interval}</t:Interval><t:DayOfMonth>${r.dayOfMonth ?? parts.dayOfMonth}</t:DayOfMonth></t:AbsoluteMonthlyRecurrence>${end}</t:Recurrence>`;
+    case "yearly":
+      return `<t:Recurrence><t:AbsoluteYearlyRecurrence><t:Interval>${interval}</t:Interval><t:DayOfMonth>${r.dayOfMonth ?? parts.dayOfMonth}</t:DayOfMonth><t:Month>${parts.monthName}</t:Month></t:AbsoluteYearlyRecurrence>${end}</t:Recurrence>`;
+  }
+}
+
+/**
+ * Create a calendar event via EWS CreateItem: either save it as an appointment / draft meeting request
+ * (saveAsDraft, nothing is sent) or send invitations to the attendees.
+ */
+export async function createMeeting(m: MeetingInput): Promise<{
+  status: "invitation_sent" | "draft_saved";
+  id?: string;
+  subject: string;
+  start: string;
+  end: string;
+  attendees: string[];
+  optionalAttendees: string[];
+}> {
+  if (m.recurrence?.ends !== undefined && m.recurrence.ends <= m.start) throw new Error("Recurrence must end after the event starts");
+  const rcpts = (name: string, list?: string[]) =>
+    list?.length
+      ? `<t:${name}>${list.map((e) => `<t:Attendee><t:Mailbox><t:EmailAddress>${esc(e)}</t:EmailAddress></t:Mailbox></t:Attendee>`).join("")}</t:${name}>`
+      : "";
+  const xml = await ews(
+    (m.saveAsDraft
+      ? `<m:CreateItem MessageDisposition="SaveOnly" SendMeetingInvitations="SendNone">`
+      : `<m:CreateItem SendMeetingInvitations="SendToAllAndSaveCopy">`) +
+      `<m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar"/></m:SavedItemFolderId>` +
+      `<m:Items><t:CalendarItem>` +
+      `<t:Subject>${esc(m.subject)}</t:Subject>` +
+      (m.body !== undefined ? `<t:Body BodyType="${m.isHtml ? "HTML" : "Text"}">${esc(m.body)}</t:Body>` : "") +
+      (m.reminderMinutes !== undefined
+        ? `<t:ReminderMinutesBeforeStart>${m.reminderMinutes}</t:ReminderMinutesBeforeStart><t:IsReminderOn>true</t:IsReminderOn>`
+        : "") +
+      `<t:Start>${isoNoMs(m.start)}</t:Start><t:End>${isoNoMs(m.end)}</t:End>` +
+      (m.location !== undefined ? `<t:Location>${esc(m.location)}</t:Location>` : "") +
+      rcpts("RequiredAttendees", m.attendees) +
+      rcpts("OptionalAttendees", m.optionalAttendees) +
+      (m.showAs ? `<t:ShowAs>${m.showAs}</t:ShowAs>` : "") +
+      (m.recurrence ? recurrenceXml(m.start, m.recurrence) : "") +
+      `</t:CalendarItem></m:Items></m:CreateItem>`,
+  );
+  if (!/ResponseClass="Success"/.test(xml) || /ResponseClass="Error"/.test(xml)) throw ewsError(xml);
+  return {
+    status: m.saveAsDraft ? "draft_saved" : "invitation_sent",
+    id: attr(xml, "ItemId", "Id"),
+    subject: m.subject,
+    start: new Date(m.start).toISOString(),
+    end: new Date(m.end).toISOString(),
+    attendees: m.attendees ?? [],
+    optionalAttendees: m.optionalAttendees ?? [],
+  };
 }
 
 export interface MailInput {
