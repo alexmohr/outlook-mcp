@@ -38,6 +38,9 @@ Online, so check your tenant's status), and the Office client ID is borrowed, so
 | `move_mail` | Move messages into a folder (sorting / filing). Returns each message's new id. |
 | `mark_mail_read` | Mark messages read or unread (`isRead: false`). No read receipts are sent. |
 | `flag_mail` | Set the follow-up flag: `flagged` (optional due date), `complete`, or `cleared`. |
+| `list_rules` | List inbox rules (server-side, in priority order) with conditions and actions. |
+| `create_rule` | Create an inbox rule from conditions (sender, subject, body, recipient, attachments, importance) and actions (move to folder, mark read, importance, categories, delete, stop processing). Applies to new mail only; no forwarding. |
+| `delete_rule` | Delete an inbox rule by id. |
 | `draft_mail` | Save a message to Drafts. Sends nothing. |
 | `send_mail` | Send a message from your mailbox. Irreversible. |
 | `create_event` | Save a calendar event. Nothing is sent: plain appointment without attendees, draft meeting request with them. Supports daily/weekly/monthly/yearly recurrence. |
@@ -70,7 +73,7 @@ Behaviour worth knowing:
   (or the machine's zone). A date-bounded series is stored as an occurrence count — Exchange Online ignores EWS's
   `RecurrenceEnd`.
 - Read-only tools are annotated `readOnlyHint`, so you can allowlist them separately from `mark_mail_read`,
-  `flag_mail`, `create_folder`, `move_mail`, `draft_mail`, `create_event`, `send_mail` and `schedule_meeting`.
+  `flag_mail`, `create_folder`, `move_mail`, `create_rule`, `delete_rule`, `draft_mail`, `create_event`, `send_mail` and `schedule_meeting`.
 
 ## Setup
 
