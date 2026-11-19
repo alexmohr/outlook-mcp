@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { login } from "./auth.js";
 import { configPath, getConfig, writeConfig, DEFAULTS } from "./config.js";
-import { createFolder, flagMail, FLAG_STATES, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail } from "./ews.js";
+import { createFolder, createMeeting, flagMail, FLAG_STATES, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail, RECURRENCE_PATTERNS, SHOW_AS, WEEKDAYS } from "./ews.js";
 import { findFreeRanges, type WorkingHours } from "./slots.js";
 
 if (process.argv[2] === "init") {
@@ -39,7 +39,7 @@ if (process.argv[2] === "login") {
   }
 }
 
-const server = new McpServer({ name: "outlook-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "outlook-mcp", version: "0.2.0" });
 
 const WELL_KNOWN_HELP = MAIL_FOLDERS.join(", ");
 const folderArg = z.string().min(1).max(1024);
@@ -58,7 +58,7 @@ function fmt(instant: number, timeZone: string): string {
 server.registerTool(
   "get_events",
   {
-    description: "List events in the user's own Outlook calendar between two ISO datetimes (read-only).",
+    description: "List events in the user's own Outlook calendar between two ISO datetimes (read-only). Recurring series are expanded. If `truncated` is true the 200-event cap was hit: narrow the range.",
     inputSchema: {
       from: z.string().describe("ISO 8601 start, e.g. 2026-11-16T00:00:00Z"),
       to: z.string().describe("ISO 8601 end"),
@@ -132,6 +132,104 @@ server.registerTool(
           minutes: Math.round((r.end - r.start) / 60_000),
         })),
       });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+const eventShape = {
+  subject: z.string().trim().min(1).max(255),
+  start: z.string().describe("ISO 8601 start (UTC or with offset), e.g. 2026-11-17T09:00:00Z"),
+  end: z.string().describe("ISO 8601 end, after start"),
+  location: z.string().max(255).optional(),
+  body: z.string().max(200_000).optional().describe("Event body / meeting request text (plain text unless isHtml)"),
+  isHtml: z.boolean().optional().describe("Treat body as HTML (default false)"),
+  attendees: z.array(z.string().email()).max(100).optional().describe("Required attendees; room/equipment mailboxes work too"),
+  optionalAttendees: z.array(z.string().email()).max(100).optional(),
+  reminderMinutes: z.number().int().min(0).max(1440).optional().describe("Alert this many minutes before the start"),
+  showAs: z.enum(SHOW_AS).optional().describe("Free/busy status while the event runs (Exchange default Busy)"),
+  recurrence: z
+    .object({
+      pattern: z.enum(RECURRENCE_PATTERNS),
+      interval: z.number().int().min(1).max(99).optional().describe("Every n days/weeks/months/years (default 1)"),
+      daysOfWeek: z.array(z.enum(WEEKDAYS)).min(1).max(7).optional().describe("Weekly only; default: the weekday of start"),
+      dayOfMonth: z.number().int().min(1).max(31).optional().describe("Monthly/yearly only; default: the day of month of start"),
+      occurrences: z.number().int().min(1).max(9999).optional().describe("Repeat this many times (alternative to ends)"),
+      ends: z.string().optional().describe("ISO 8601; repeat until this instant (alternative to occurrences)"),
+    })
+    .optional()
+    .describe("Repeat the event daily/weekly/monthly/yearly"),
+};
+
+/** Shared handler for create_event (SaveOnly) and schedule_meeting (send invitations). */
+async function createEvent(a: z.infer<z.ZodObject<typeof eventShape>>, saveAsDraft: boolean) {
+  const start = Date.parse(a.start), end = Date.parse(a.end);
+  if (Number.isNaN(start) || Number.isNaN(end)) throw new Error("`start`/`end` must be ISO 8601 datetimes");
+  if (end <= start) throw new Error("`end` must be after `start`");
+  const r = a.recurrence;
+  if (r && r.pattern !== "weekly" && r.daysOfWeek) throw new Error("`daysOfWeek` only applies to weekly recurrence");
+  if (r?.ends !== undefined && Number.isNaN(Date.parse(r.ends))) throw new Error("`recurrence.ends` must be an ISO 8601 datetime");
+  return text(
+    await createMeeting({
+      subject: a.subject,
+      start,
+      end,
+      location: a.location,
+      body: a.body,
+      isHtml: a.isHtml,
+      attendees: a.attendees,
+      optionalAttendees: a.optionalAttendees,
+      reminderMinutes: a.reminderMinutes,
+      showAs: a.showAs,
+      recurrence: r
+        ? {
+            pattern: r.pattern,
+            interval: r.interval,
+            daysOfWeek: r.daysOfWeek,
+            dayOfMonth: r.dayOfMonth,
+            occurrences: r.occurrences,
+            ends: r.ends === undefined ? undefined : Date.parse(r.ends),
+          }
+        : undefined,
+      saveAsDraft,
+    }),
+  );
+}
+
+server.registerTool(
+  "create_event",
+  {
+    description:
+      "Save a calendar event in the user's Outlook calendar. Nothing is sent to anyone: with attendees this is only a " +
+      "DRAFT meeting request they have to be invited with later; without attendees it is a plain appointment. Use " +
+      "schedule_meeting to actually invite people. Supports daily/weekly/monthly/yearly recurrence.",
+    inputSchema: eventShape,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async (a) => {
+    try {
+      return await createEvent(a, true);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "schedule_meeting",
+  {
+    description:
+      "Create a calendar event AND send meeting invitations to its attendees (and save a copy). Sending invitations is " +
+      "irreversible: only call it with the date, subject and attendees the user has explicitly approved. Needs at " +
+      "least one attendee; use create_event to save an appointment or a draft request without notifying anyone.",
+    inputSchema: eventShape,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  async (a) => {
+    try {
+      if (!a.attendees?.length) throw new Error("`attendees` with at least one address required (use create_event for appointments/drafts)");
+      return await createEvent(a, false);
     } catch (e) {
       return fail(e);
     }
