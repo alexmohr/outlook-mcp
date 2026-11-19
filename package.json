@@ -1,7 +1,7 @@
 {
   "name": "outlook-mcp",
-  "version": "0.1.0",
-  "description": "Outlook (EWS) MCP server: calendar events, free meeting slots, and sending mail",
+  "version": "0.2.0",
+  "description": "Outlook (EWS) MCP server: calendar events, meeting scheduling, free meeting slots, and sending mail",
   "type": "module",
   "bin": {
     "outlook-mcp": "dist/index.js"

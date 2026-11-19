@@ -28,7 +28,7 @@ Online, so check your tenant's status), and the Office client ID is borrowed, so
 
 | Tool | What it does |
 |---|---|
-| `get_events` | Events in your own calendar between two ISO datetimes (recurrences expanded). |
+| `get_events` | Events in your own calendar between two ISO datetimes (recurrences expanded). `truncated: true` means the 200-event cap was hit: narrow the range. |
 | `find_free_slots` | Free meeting slots inside working hours, optionally intersected with other people's free/busy. |
 | `list_mail` | Overview of a folder, newest first: id, sender, subject, received, read state, preview. Supports `unreadOnly`, `since`, paging. |
 | `search_mail` | Server-side mail search (Exchange query syntax) across all folders or one: `from:alice subject:(budget OR forecast) hasattachments:true received:>=2026-11-01`. Same result fields as `list_mail`. |
@@ -40,6 +40,8 @@ Online, so check your tenant's status), and the Office client ID is borrowed, so
 | `flag_mail` | Set the follow-up flag: `flagged` (optional due date), `complete`, or `cleared`. |
 | `draft_mail` | Save a message to Drafts. Sends nothing. |
 | `send_mail` | Send a message from your mailbox. Irreversible. |
+| `create_event` | Save a calendar event. Nothing is sent: plain appointment without attendees, draft meeting request with them. Supports daily/weekly/monthly/yearly recurrence. |
+| `schedule_meeting` | Create a calendar event **and** send the invitations to its attendees. Irreversible. Same options as `create_event`. |
 
 Behaviour worth knowing:
 
@@ -59,8 +61,16 @@ Behaviour worth knowing:
 - `find_free_slots` treats attendees whose free/busy can't be fetched as free and says so in `warnings`. Free/busy of
   others only works if your organisation shares it. Range is limited to 62 days.
 - `send_mail` and `draft_mail` take `to`, `cc`, `bcc`, `subject`, `body`, `isHtml`. Prefer `draft_mail` first.
+- `create_event` and `schedule_meeting` take the same shape (`start`/`end` as ISO 8601, plus `location`, `body`,
+  `attendees`, `optionalAttendees`, `reminderMinutes`, `showAs`, `recurrence`). `create_event` never notifies anyone —
+  with attendees it stays a draft request in your calendar; `schedule_meeting` sends the invitations. Room and
+  equipment mailboxes go in `attendees`.
+- Recurrence: `daily`/`weekly`/`monthly`/`yearly` with `interval`, ending at `occurrences` or `ends`. Weekly
+  `daysOfWeek` (defaults to the weekday of `start`) and the derived day-of-month/month use `timeZone` from your config
+  (or the machine's zone). A date-bounded series is stored as an occurrence count — Exchange Online ignores EWS's
+  `RecurrenceEnd`.
 - Read-only tools are annotated `readOnlyHint`, so you can allowlist them separately from `mark_mail_read`,
-  `flag_mail`, `create_folder`, `move_mail`, `draft_mail` and `send_mail`.
+  `flag_mail`, `create_folder`, `move_mail`, `draft_mail`, `create_event`, `send_mail` and `schedule_meeting`.
 
 ## Setup
 
@@ -135,5 +145,5 @@ Layout: `src/index.ts` (tools, `init`/`login` subcommands), `src/ews.ts` (EWS re
 
 - The server can read and send mail as you. Anyone who can read `token-cache.json` has the same access until the
   session is revoked; keep `~/.config/outlook-mcp` out of backups and sync folders you share.
-- `send_mail` is irreversible. Keep Claude Code's approval prompt on for it.
+- `send_mail` and `schedule_meeting` are irreversible (they notify people). Keep Claude Code's approval prompt on for them.
 - Nothing secret is stored in this repository; tokens and tenant ID live only in `~/.config/outlook-mcp/`.
