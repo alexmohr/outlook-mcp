@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { login } from "./auth.js";
 import { configPath, getConfig, writeConfig, DEFAULTS } from "./config.js";
-import { createFolder, createMeeting, flagMail, FLAG_STATES, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail, RECURRENCE_PATTERNS, SHOW_AS, WEEKDAYS } from "./ews.js";
+import { createFolder, createMeeting, createRule, deleteRule, flagMail, listRules, RULE_IMPORTANCE, FLAG_STATES, getBusy, getEvents, getMyEmail, listFolders, listMail, MAIL_FOLDERS, markMailRead, moveMail, readMail, sendMail, RECURRENCE_PATTERNS, SHOW_AS, WEEKDAYS } from "./ews.js";
 import { findFreeRanges, type WorkingHours } from "./slots.js";
 
 if (process.argv[2] === "init") {
@@ -486,3 +486,75 @@ server.registerTool(
 );
 
 await server.connect(new StdioServerTransport());
+
+server.registerTool(
+  "list_rules",
+  {
+    description:
+      "List the mailbox's inbox rules (server-side rules that act on incoming mail) in priority order, with id, name, " +
+      "enabled state, conditions and actions. Use the ids with delete_rule.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  async () => {
+    try {
+      return text(await listRules());
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+const strList = z.array(z.string().min(1).max(255)).min(1).max(20);
+
+server.registerTool(
+  "create_rule",
+  {
+    description:
+      "Create an inbox rule. It runs on the server for messages arriving from now on (it does not touch existing mail; " +
+      "use move_mail for that). At least one condition and one action are required; all given conditions must match. " +
+      "Forwarding/redirecting is deliberately not supported.",
+    inputSchema: {
+      name: z.string().trim().min(1).max(255).describe("Unique rule name"),
+      priority: z.number().int().min(1).optional().describe("1 runs first; default: after all existing rules"),
+      enabled: z.boolean().optional().describe("Default true"),
+      fromAddresses: strList.optional().describe("Condition: sender is one of these email addresses"),
+      senderContains: strList.optional().describe("Condition: sender address/name contains any of these strings"),
+      subjectContains: strList.optional().describe("Condition: subject contains any of these strings"),
+      bodyContains: strList.optional().describe("Condition: body contains any of these strings"),
+      sentToAddresses: strList.optional().describe("Condition: sent to any of these addresses"),
+      hasAttachments: z.boolean().optional().describe("Condition: has (or has no) attachments"),
+      importance: z.enum(RULE_IMPORTANCE).optional().describe("Condition: message importance"),
+      moveToFolder: folderArg.optional().describe(`Action: ${WELL_KNOWN_HELP}, or a folder id from list_folders`),
+      markAsRead: z.boolean().optional().describe("Action: mark as read"),
+      markImportance: z.enum(RULE_IMPORTANCE).optional().describe("Action: set importance"),
+      assignCategories: strList.optional().describe("Action: assign these categories"),
+      deleteMessage: z.boolean().optional().describe("Action: move to Deleted Items"),
+      stopProcessingRules: z.boolean().optional().describe("Action: skip lower-priority rules"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async (a) => {
+    try {
+      return text(await createRule(a));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.registerTool(
+  "delete_rule",
+  {
+    description: "Delete an inbox rule by id (from list_rules). Messages already processed by it are not affected.",
+    inputSchema: { id: z.string().min(1).describe("Rule id from list_rules") },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  async ({ id }) => {
+    try {
+      return text(await deleteRule(id));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
